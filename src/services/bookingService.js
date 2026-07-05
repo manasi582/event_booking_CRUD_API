@@ -5,24 +5,17 @@ const pool = require("../config/db");
 // ----------------------
 async function createBooking(eventId, userId) {
 
-    // Atomic update
-    const updateResult = await pool.query(
-        `
-        UPDATE events
-        SET booked_seats = booked_seats + 1
-        WHERE id = $1
-        AND booked_seats < total_seats
-        RETURNING *;
-        `,
-        [eventId]
-    );
+    const MAX_RETRIES = 20;
 
-    // No row updated = either event doesn't exist OR sold out
-    if (updateResult.rows.length === 0) {
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
 
-        // Check whether the event exists
+        // Read current event
         const eventResult = await pool.query(
-            "SELECT id FROM events WHERE id = $1",
+            `
+            SELECT *
+            FROM events
+            WHERE id = $1
+            `,
             [eventId]
         );
 
@@ -30,20 +23,50 @@ async function createBooking(eventId, userId) {
             throw new Error("Event not found");
         }
 
-        throw new Error("Sold Out");
+        const event = eventResult.rows[0];
+
+        if (event.booked_seats >= event.total_seats) {
+            throw new Error("Sold Out");
+        }
+
+        // Try updating using version
+        const updateResult = await pool.query(
+            `
+            UPDATE events
+            SET booked_seats = booked_seats + 1,
+                version = version + 1
+            WHERE id = $1
+            AND version = $2
+            RETURNING *;
+            `,
+            [eventId, event.version]
+        );
+
+        // Someone else updated first
+        if (updateResult.rows.length === 0) {
+
+            console.log(`Retry ${attempt}`);
+
+            // Wait 5 ms before trying again
+            await new Promise(resolve => setTimeout(resolve, 5));
+
+            continue;
+}
+
+        // Success -> create booking
+        const bookingResult = await pool.query(
+            `
+            INSERT INTO bookings (event_id, user_id, status)
+            VALUES ($1,$2,'CONFIRMED')
+            RETURNING *;
+            `,
+            [eventId, userId]
+        );
+
+        return bookingResult.rows[0];
     }
 
-    // Create booking
-    const bookingResult = await pool.query(
-        `
-        INSERT INTO bookings (event_id, user_id, status)
-        VALUES ($1, $2, 'CONFIRMED')
-        RETURNING *;
-        `,
-        [eventId, userId]
-    );
-
-    return bookingResult.rows[0];
+    throw new Error("Could not complete booking after retries.");
 }
 
 // ----------------------
